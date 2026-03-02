@@ -10,4 +10,4 @@
 在 root 权限下执行以下命令，即可完成全自动部署：
 
 ```bash
-curl -sSO [https://raw.githubusercontent.com/linxiao2723/server-f2b/main/f2b.sh](https://raw.githubusercontent.com/linxiao2723/server-f2b/main/f2b.sh) && chmod +x f2b.sh && sudo ./f2b.sh
+curl -sSO https://raw.githubusercontent.com/linxiao2723/server-f2b/main/f2b.sh && chmod +x f2b.sh && sudo ./f2b.sh
