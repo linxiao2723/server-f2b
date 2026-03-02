@@ -1,74 +1,70 @@
 #!/bin/bash
 
 # ====================================================
-# Fail2Ban 全能防御一键部署脚本
-# 包含：SSH防护 + 惯犯7天封禁 + 日志自动管理
+# Fail2Ban 全自动一键部署脚本 (终极兼容版)
+# 适用：Debian/Ubuntu/CentOS
+# 功能：自动修源 + 基础防护 + 惯犯重罚 + 日志维护
 # ====================================================
 
 # 1. 权限检查
 if [ "$EUID" -ne 0 ]; then 
-  echo "❌ 请以 root 权限运行此脚本 (sudo ./script.sh)"
+  echo "❌ 请以 root 权限运行此脚本"
   exit 1
 fi
 
-echo "🚀 开始部署 Fail2Ban 安全防御体系..."
+echo "🛠️  步骤 1: 正在修复系统环境..."
 
-# 2. 自动识别并安装软件包
-if [ -f /etc/debian_version ]; then
-    apt update && apt install -y fail2ban python3-systemd iptables
-elif [ -f /etc/redhat-release ]; then
-    yum install -y epel-release
-    yum install -y fail2ban iptables
-else
-    echo "❌ 暂不支持的系统发行版。"
-    exit 1
+# 自动处理 Debian Bullseye backports 404 错误
+if [ -f /etc/apt/sources.list ]; then
+    sed -i '/backports/s/^/#/' /etc/apt/sources.list 2>/dev/null
+    rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null
 fi
 
-# 3. 备份现有配置（如有）
-[ -f /etc/fail2ban/jail.local ] && cp /etc/fail2ban/jail.local /etc/fail2ban/jail.local.bak
+# 2. 软件安装
+echo "📦 步骤 2: 正在安装 Fail2Ban 及必要组件..."
+if [ -f /etc/debian_version ]; then
+    apt-get update -qq
+    apt-get install -y fail2ban python3-systemd iptables >/dev/null
+elif [ -f /etc/redhat-release ]; then
+    yum install -y epel-release >/dev/null
+    yum install -y fail2ban iptables >/dev/null
+fi
 
-echo "📝 注入安全规则 (SSH + Recidive)..."
+# 3. 解决 Debian 11/12+ 的 iptables 兼容性警告
+if [ -f /usr/sbin/iptables-legacy ]; then
+    update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1
+fi
+
+echo "📝 步骤 3: 正在注入安全防御规则..."
 
 # 4. 写入整合配置
 cat <<EOF > /etc/fail2ban/jail.local
 [DEFAULT]
-# 忽略本机及本地链路
 ignoreip = 127.0.0.1/8 ::1
-# 基础封禁：1天
 bantime  = 1d
-# 查找间隔：10分钟
 findtime = 10m
-# 尝试次数：3次
 maxretry = 3
-# 使用最稳定的 iptables 动作
 banaction = iptables-multiport
 banaction_allports = iptables-allports
 
 [sshd]
-# 开启 SSH 监控
 enabled = true
 port    = ssh
 backend = systemd
-# 开启激进模式，匹配更多非法尝试
 mode    = aggressive
 
 [recidive]
-# 惯犯监控：针对反复被封的 IP
 enabled  = true
 logpath  = /var/log/fail2ban.log
 banaction = iptables-allports
-# 查找过去 1 天内被封禁过的记录
 findtime = 1d
-# 如果 1 天内被封禁超过 3 次
 maxretry = 3
-# 直接升级封禁 1 周 (7d)
 bantime  = 7d
 protocol = tcp
 EOF
 
-echo "🧹 配置日志自动轮转..."
-
-# 5. 配置日志管理 (logrotate)
+# 5. 配置日志自动轮转
+echo "🧹 步骤 4: 正在配置日志自动管理..."
 cat <<EOF > /etc/logrotate.d/fail2ban
 /var/log/fail2ban.log {
     weekly
@@ -83,19 +79,13 @@ cat <<EOF > /etc/logrotate.d/fail2ban
 }
 EOF
 
-# 6. 启动并激活
-systemctl enable fail2ban
-systemctl restart fail2ban
+# 6. 重启服务
+systemctl stop fail2ban >/dev/null 2>&1
+systemctl enable fail2ban >/dev/null 2>&1
+systemctl start fail2ban
 
 echo "✅ 部署完成！"
 echo "------------------------------------------------"
-echo "🛡️ 当前防御状态："
-echo "1. 普通攻击：3次失败封 1 天"
-echo "2. 顽固攻击：24小时内封 3 次则升级封 7 天"
-echo "3. 日志管理：每周自动清理压缩，保留 4 周"
+echo "🛡️  服务器已进入高强度受保护状态"
 echo "------------------------------------------------"
-echo "💡 常用查看命令："
-echo "- 查看SSH拦截：sudo fail2ban-client status sshd"
-echo "- 查看惯犯名单：sudo fail2ban-client status recidive"
-echo "- 查看实时日志：sudo tail -f /var/log/fail2ban.log"
-echo "------------------------------------------------"
+fail2ban-client status sshd
