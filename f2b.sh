@@ -1,108 +1,210 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 # ====================================================
-# Fail2Ban 全自动一键部署脚本 (终极优化版)
-# 包含：自动修源 + 阶梯封禁 + 惯犯重罚 + 日志维护
+# Fail2Ban 全自动一键部署脚本（稳妥增强版）
+# 特点：
+# - 自动修复部分 Debian APT 源问题
+# - 自动安装 fail2ban
+# - 自动识别 SSH 真实端口
+# - 启用递增封禁 + recidive 惯犯封禁
+# - 自动日志轮转
+# - 自动备份旧配置
 # ====================================================
 
-# 1. 权限检查
-if [ "$EUID" -ne 0 ]; then 
-  echo "❌ 请以 root 权限运行此脚本"
-  exit 1
+if [ "${EUID}" -ne 0 ]; then
+echo "❌ 请以 root 权限运行此脚本"
+exit 1
 fi
 
-echo "🛠️  步骤 1: 正在清理并修复系统环境..."
-# 自动处理 Debian Bullseye 软件源 404 问题
-if [ -f /etc/apt/sources.list ]; then
-    sed -i '/backports/s/^/#/' /etc/apt/sources.list 2>/dev/null
-    rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null
-fi
+log() { echo -e "[+] $*"; }
+warn() { echo -e "[!] $*"; }
+err() { echo -e "[-] $*" >&2; }
 
-# 2. 强制安装组件
-echo "📦 步骤 2: 正在安装 Fail2Ban 及必要组件..."
+FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
+BACKUP_TIME="$(date +%F-%H%M%S)"
+OS_FAMILY=""
+SSH_PORTS=""
+F2B_BACKEND="auto"
+F2B_BANACTION="iptables-multiport"
+F2B_BANACTION_ALLPORTS="iptables-allports"
+
+detect_os() {
 if [ -f /etc/debian_version ]; then
-    apt-get update -qq
-    apt-get install -y fail2ban python3-systemd iptables >/dev/null
+OS_FAMILY="debian"
 elif [ -f /etc/redhat-release ]; then
-    yum install -y epel-release >/dev/null
-    yum install -y fail2ban iptables >/dev/null
+OS_FAMILY="redhat"
+else
+err "当前系统不在支持范围内（仅 Debian/Ubuntu/CentOS/RHEL）"
+exit 1
 fi
 
-# 3. 解决 iptables 兼容性问题
-if [ -f /usr/sbin/iptables-legacy ]; then
-    update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1
+log "检测到系统类型：${OS_FAMILY}"
+}
+
+fix_apt_sources_if_needed() {
+if [ "${OS_FAMILY}" != "debian" ]; then
+return
 fi
 
-echo "📝 步骤 3: 正在注入终极优化规则..."
+log "步骤 1: 检查并修复 APT 源..."
+if [ -f /etc/apt/sources.list ]; then
+sed -i '/backports/s/^/#/' /etc/apt/sources.list 2>/dev/null || true
+rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null || true
+fi
+}
 
-# 4. 写入整合配置 (含阶梯封禁)
-cat <<EOF > /etc/fail2ban/jail.local
+install_packages() {
+log "步骤 2: 安装 Fail2Ban 及必要组件..."
+
+if [ "${OS_FAMILY}" = "debian" ]; then
+apt-get update -qq
+apt-get install -y fail2ban python3-systemd iptables >/dev/null
+else
+yum install -y epel-release >/dev/null || true
+yum install -y fail2ban iptables >/dev/null
+fi
+}
+
+detect_ssh_ports() {
+SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | sort -u | paste -sd, - || true)"
+
+if [ -z "${SSH_PORTS}" ]; then
+SSH_PORTS="$(grep -hE '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | sort -u | paste -sd, - || true)"
+fi
+
+if [ -z "${SSH_PORTS}" ]; then
+SSH_PORTS="22"
+warn "未能自动识别 SSH 端口，已回退为 22"
+fi
+
+log "检测到 SSH 端口：${SSH_PORTS}"
+}
+
+detect_backend() {
+if command -v journalctl >/dev/null 2>&1; then
+F2B_BACKEND="systemd"
+else
+F2B_BACKEND="auto"
+fi
+
+log "Fail2Ban backend：${F2B_BACKEND}"
+}
+
+detect_banaction() {
+if command -v nft >/dev/null 2>&1 && [ -f /etc/fail2ban/action.d/nftables-multiport.conf ]; then
+F2B_BANACTION="nftables-multiport"
+F2B_BANACTION_ALLPORTS="nftables-allports"
+else
+F2B_BANACTION="iptables-multiport"
+F2B_BANACTION_ALLPORTS="iptables-allports"
+fi
+
+log "banaction：${F2B_BANACTION}"
+}
+
+backup_existing_config() {
+log "步骤 3: 备份旧配置..."
+
+if [ -f "${FAIL2BAN_JAIL}" ]; then
+cp "${FAIL2BAN_JAIL}" "${FAIL2BAN_JAIL}.bak-${BACKUP_TIME}"
+log "已备份 ${FAIL2BAN_JAIL} -> ${FAIL2BAN_JAIL}.bak-${BACKUP_TIME}"
+fi
+}
+
+write_jail_config() {
+log "步骤 4: 写入防护规则..."
+
+cat > "${FAIL2BAN_JAIL}" <<EOF
 [DEFAULT]
-# 白名单：请在后面添加你的固定 IP (如有)
 ignoreip = 127.0.0.1/8 ::1
 
-# --- 阶梯封禁核心配置 ---
-# 基础封禁时间：1天
-bantime  = 1d
-# 开启时间递增功能
+bantime = 12h
 bantime.increment = true
-# 增长倍数：1天 -> 2天 -> 4天 -> 8天...
 bantime.factor = 2
-# 最大封禁上限：5周 (让顽固分子彻底消失)
-bantime.maxtime = 5w
+bantime.maxtime = 4w
 
-# 触发条件：10分钟内失败 3 次
 findtime = 10m
-maxretry = 3
+maxretry = 5
 
-# 防火墙动作
-banaction = iptables-multiport
-banaction_allports = iptables-allports
+banaction = ${F2B_BANACTION}
+banaction_allports = ${F2B_BANACTION_ALLPORTS}
 
 [sshd]
 enabled = true
-port    = ssh
-backend = systemd
-# 激进模式：捕获所有非法尝试
-mode    = aggressive
+port = ${SSH_PORTS}
+backend = ${F2B_BACKEND}
+mode = aggressive
 
 [recidive]
-# 惯犯监狱：针对在其他监狱反复进出的 IP
-enabled  = true
-logpath  = /var/log/fail2ban.log
-banaction = iptables-allports
-findtime = 1d
+enabled = true
+logpath = /var/log/fail2ban.log
+backend = auto
+banaction = ${F2B_BANACTION_ALLPORTS}
+findtime = 7d
 maxretry = 3
-# 惯犯直接从 1 周封禁起步
-bantime  = 1w
-# 惯犯监狱不使用递增，避免逻辑过载
+bantime = 4w
 bantime.increment = false
 protocol = tcp
 EOF
+}
 
-# 5. 配置日志管理 (logrotate)
-echo "🧹 步骤 4: 正在配置日志自动管理..."
-cat <<EOF > /etc/logrotate.d/fail2ban
+write_logrotate() {
+log "步骤 5: 配置日志轮转..."
+
+cat > /etc/logrotate.d/fail2ban <<'EOF'
 /var/log/fail2ban.log {
-    weekly
-    rotate 4
-    compress
-    delaycompress
-    missingok
-    notifempty
-    postrotate
-        /usr/bin/fail2ban-client flushlogs >/dev/null || true
-    endscript
+weekly
+rotate 4
+compress
+delaycompress
+missingok
+notifempty
+postrotate
+/usr/bin/fail2ban-client flushlogs >/dev/null 2>&1 || true
+endscript
 }
 EOF
+}
 
-# 6. 重启并验证
-systemctl stop fail2ban >/dev/null 2>&1
+restart_fail2ban() {
+log "步骤 6: 启用并重启 Fail2Ban..."
 systemctl enable fail2ban >/dev/null 2>&1
-systemctl start fail2ban
+systemctl restart fail2ban
+}
 
-echo "✅ 终极部署完成！"
+verify_fail2ban() {
+log "步骤 7: 验证状态..."
+fail2ban-client ping >/dev/null
+
+echo "✅ 部署完成！"
 echo "------------------------------------------------"
-echo "🛡️  已启用：[阶梯封禁] + [惯犯重罚] + [日志轮转]"
+echo "🛡️ 已启用：递增封禁 + 惯犯重罚 + 日志轮转"
+echo "📊 当前 Fail2Ban 状态："
+fail2ban-client status
+echo
 echo "📊 当前 SSH 拦截状态："
-fail2ban-client status sshd
+fail2ban-client status sshd || true
+echo
+echo "ℹ️ 常用命令："
+echo " fail2ban-client status"
+echo " fail2ban-client status sshd"
+echo " fail2ban-client set sshd unbanip <IP>"
+echo " tail -f /var/log/fail2ban.log"
+}
+
+main() {
+detect_os
+fix_apt_sources_if_needed
+install_packages
+detect_ssh_ports
+detect_backend
+detect_banaction
+backup_existing_config
+write_jail_config
+write_logrotate
+restart_fail2ban
+verify_fail2ban
+}
+
+main "$@"
