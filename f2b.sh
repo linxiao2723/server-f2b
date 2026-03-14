@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # ====================================================
-# Fail2Ban 全自动一键部署脚本（稳妥增强版）
+# Fail2Ban 全自动一键部署脚本（Debian / Ubuntu 最终版）
 # 特点：
 # - 自动修复部分 Debian APT 源问题
 # - 自动安装 fail2ban
 # - 自动识别 SSH 真实端口
+# - 自动识别 ssh.service / sshd.service
 # - 启用递增封禁 + recidive 惯犯封禁
 # - 自动日志轮转
 # - 自动备份旧配置
@@ -28,6 +29,8 @@ SSH_PORTS=""
 F2B_BACKEND="auto"
 F2B_BANACTION="iptables-multiport"
 F2B_BANACTION_ALLPORTS="iptables-allports"
+SSH_UNIT="sshd.service"
+SSH_JOURNALMATCH="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
 
 detect_os() {
 if [ -f /etc/debian_version ]; then
@@ -103,6 +106,20 @@ fi
 log "banaction：${F2B_BANACTION}"
 }
 
+detect_ssh_unit() {
+if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+SSH_UNIT="ssh.service"
+elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+SSH_UNIT="sshd.service"
+else
+SSH_UNIT="sshd.service"
+fi
+
+SSH_JOURNALMATCH="_SYSTEMD_UNIT=${SSH_UNIT} + _COMM=sshd"
+log "检测到 SSH systemd unit：${SSH_UNIT}"
+log "journalmatch：${SSH_JOURNALMATCH}"
+}
+
 backup_existing_config() {
 log "步骤 3: 备份旧配置..."
 
@@ -134,6 +151,7 @@ banaction_allports = ${F2B_BANACTION_ALLPORTS}
 enabled = true
 port = ${SSH_PORTS}
 backend = ${F2B_BACKEND}
+journalmatch = ${SSH_JOURNALMATCH}
 mode = aggressive
 
 [recidive]
@@ -149,7 +167,8 @@ protocol = tcp
 EOF
 }
 
-write_logrotate() {
+write_logrotate()
+{
 log "步骤 5: 配置日志轮转..."
 
 cat > /etc/logrotate.d/fail2ban <<'EOF'
@@ -200,6 +219,7 @@ install_packages
 detect_ssh_ports
 detect_backend
 detect_banaction
+detect_ssh_unit
 backup_existing_config
 write_jail_config
 write_logrotate
