@@ -1,28 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ====================================================
-# Fail2Ban 全自动一键部署脚本（Debian / Ubuntu 最终版）
-# 特点：
-# - 自动修复部分 Debian APT 源问题
-# - 自动安装 fail2ban
-# - 自动识别 SSH 真实端口
-# - 自动识别 ssh.service / sshd.service
-# - 启用递增封禁 + recidive 惯犯封禁
-# - 自动日志轮转
-# - 自动备份旧配置
-# ====================================================
-
-if [ "${EUID}" -ne 0 ]; then
-echo "❌ 请以 root 权限运行此脚本"
-exit 1
-fi
-
-log() { echo -e "[+] $*"; }
-warn() { echo -e "[!] $*"; }
-err() { echo -e "[-] $*" >&2; }
-
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
+LOGROTATE_FILE="/etc/logrotate.d/fail2ban"
 BACKUP_TIME="$(date +%F-%H%M%S)"
 OS_FAMILY=""
 SSH_PORTS=""
@@ -32,17 +12,27 @@ F2B_BANACTION_ALLPORTS="iptables-allports"
 SSH_UNIT="sshd.service"
 SSH_JOURNALMATCH="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
 
+green() { echo -e "\033[32m$*\033[0m"; }
+yellow() { echo -e "\033[33m$*\033[0m"; }
+red() { echo -e "\033[31m$*\033[0m"; }
+cyan() { echo -e "\033[36m$*\033[0m"; }
+
+need_root() {
+if [ "${EUID}" -ne 0 ]; then
+red "❌ 请以 root 权限运行"
+exit 1
+fi
+}
+
 detect_os() {
 if [ -f /etc/debian_version ]; then
 OS_FAMILY="debian"
 elif [ -f /etc/redhat-release ]; then
 OS_FAMILY="redhat"
 else
-err "当前系统不在支持范围内（仅 Debian/Ubuntu/CentOS/RHEL）"
+red "❌ 当前系统不在支持范围内（仅 Debian/Ubuntu/CentOS/RHEL）"
 exit 1
 fi
-
-log "检测到系统类型：${OS_FAMILY}"
 }
 
 fix_apt_sources_if_needed() {
@@ -50,7 +40,7 @@ if [ "${OS_FAMILY}" != "debian" ]; then
 return
 fi
 
-log "步骤 1: 检查并修复 APT 源..."
+yellow "🛠️ 检查并修复 APT 源..."
 if [ -f /etc/apt/sources.list ]; then
 sed -i '/backports/s/^/#/' /etc/apt/sources.list 2>/dev/null || true
 rm -f /etc/apt/sources.list.d/backports.list 2>/dev/null || true
@@ -58,7 +48,7 @@ fi
 }
 
 install_packages() {
-log "步骤 2: 安装 Fail2Ban 及必要组件..."
+yellow "📦 安装 Fail2Ban 及必要组件..."
 
 if [ "${OS_FAMILY}" = "debian" ]; then
 apt-get update -qq
@@ -78,10 +68,8 @@ fi
 
 if [ -z "${SSH_PORTS}" ]; then
 SSH_PORTS="22"
-warn "未能自动识别 SSH 端口，已回退为 22"
+yellow "⚠️ 未能自动识别 SSH 端口，已回退为 22"
 fi
-
-log "检测到 SSH 端口：${SSH_PORTS}"
 }
 
 detect_backend() {
@@ -90,8 +78,6 @@ F2B_BACKEND="systemd"
 else
 F2B_BACKEND="auto"
 fi
-
-log "Fail2Ban backend：${F2B_BACKEND}"
 }
 
 detect_banaction() {
@@ -102,8 +88,6 @@ else
 F2B_BANACTION="iptables-multiport"
 F2B_BANACTION_ALLPORTS="iptables-allports"
 fi
-
-log "banaction：${F2B_BANACTION}"
 }
 
 detect_ssh_unit() {
@@ -116,22 +100,16 @@ SSH_UNIT="sshd.service"
 fi
 
 SSH_JOURNALMATCH="_SYSTEMD_UNIT=${SSH_UNIT} + _COMM=sshd"
-log "检测到 SSH systemd unit：${SSH_UNIT}"
-log "journalmatch：${SSH_JOURNALMATCH}"
 }
 
 backup_existing_config() {
-log "步骤 3: 备份旧配置..."
-
 if [ -f "${FAIL2BAN_JAIL}" ]; then
 cp "${FAIL2BAN_JAIL}" "${FAIL2BAN_JAIL}.bak-${BACKUP_TIME}"
-log "已备份 ${FAIL2BAN_JAIL} -> ${FAIL2BAN_JAIL}.bak-${BACKUP_TIME}"
+green "✅ 已备份旧配置：${FAIL2BAN_JAIL}.bak-${BACKUP_TIME}"
 fi
 }
 
 write_jail_config() {
-log "步骤 4: 写入防护规则..."
-
 cat > "${FAIL2BAN_JAIL}" <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
@@ -167,11 +145,8 @@ protocol = tcp
 EOF
 }
 
-write_logrotate()
-{
-log "步骤 5: 配置日志轮转..."
-
-cat > /etc/logrotate.d/fail2ban <<'EOF'
+write_logrotate() {
+cat > "${LOGROTATE_FILE}" <<'EOF'
 /var/log/fail2ban.log {
 weekly
 rotate 4
@@ -186,49 +161,34 @@ endscript
 EOF
 }
 
-restart_fail2ban() {
-log "步骤 6: 启用并重启 Fail2Ban..."
-systemctl enable fail2ban >/dev/null 2>&1
-systemctl restart fail2ban
-}
-
 verify_fail2ban() {
-log "步骤 7: 验证状态..."
+yellow "🔍 正在验证 Fail2Ban 状态..."
 
 local retries=10
 local i=1
 
 while [ $i -le $retries ]; do
 if fail2ban-client ping >/dev/null 2>&1; then
-echo "✅ 部署完成！"
-echo "------------------------------------------------"
-echo "🛡️ 已启用：递增封禁 + 惯犯重罚 + 日志轮转"
-echo "📊 当前 Fail2Ban 状态："
-fail2ban-client status
+green "✅ Fail2Ban 启动成功"
 echo
-echo "📊 当前 SSH 拦截状态："
+fail2ban-client status || true
+echo
 fail2ban-client status sshd || true
-echo
-echo "ℹ️ 常用命令："
-echo " fail2ban-client status"
-echo " fail2ban-client status sshd"
-echo " fail2ban-client set sshd unbanip <IP>"
-echo " tail -f /var/log/fail2ban.log"
 return 0
 fi
-
 sleep 1
 i=$((i+1))
 done
 
-err "Fail2Ban 启动超时，请手动排查："
-echo " systemctl status fail2ban --no-pager -l"
-echo " journalctl -u fail2ban -n 80 --no-pager"
-exit 1
+red "❌ F
+ail
+2Ban 启动超时，请手动排查："
+echo "systemctl status fail2ban --no-pager -l"
+echo "journalctl -u fail2ban -n 80 --no-pager"
+return 1
 }
-
-
-main() {
+install_f2b() {
+yellow "🚀 开始安装 / 重装 Fail2Ban 防护..."
 detect_os
 fix_apt_sources_if_needed
 install_packages
@@ -239,8 +199,154 @@ detect_ssh_unit
 backup_existing_config
 write_jail_config
 write_logrotate
-restart_fail2ban
+
+systemctl enable fail2ban >/dev/null 2>&1
+systemctl restart fail2ban
+
+echo
+green "🎉 配置写入完成"
+echo "------------------------------------------------"
+echo "系统类型: ${OS_FAMILY}"
+echo "SSH端口 : ${SSH_PORTS}"
+echo "backend : ${F2B_BACKEND}"
+echo "banaction: ${F2B_BANACTION}"
+echo "journalmatch: ${SSH_JOURNALMATCH}"
+echo "------------------------------------------------"
+echo
+
 verify_fail2ban
+}
+
+show_status() {
+echo
+cyan "📊 Fail2Ban 总状态"
+echo "------------------------------------------------"
+fail2ban-client status || true
+echo
+}
+
+show_sshd_status() {
+echo
+cyan "🛡️ SSHD Jail 状态"
+echo "------------------------------------------------"
+fail2ban-client status sshd || true
+echo
+}
+
+unban_ip() {
+echo
+read -rp "请输入要解封的 IP: " TARGET_IP
+if [ -z "${TARGET_IP}" ]; then
+yellow "⚠️ 未输入 IP，已取消"
+return
+fi
+
+fail2ban-client set sshd unbanip "${TARGET_IP}" && green "✅ 已尝试解封 ${TARGET_IP}"
+}
+
+uninstall_f2b() {
+echo
+red "⚠️ 你即将执行【足够完整卸载】"
+echo "这会执行以下操作："
+echo " - 停止 fail2ban"
+echo " - 禁用开机自启"
+echo " - 删除 jail.local"
+echo " - 删除 fail2ban 日志轮转配置"
+echo " - 卸载 fail2ban 软件包"
+echo " - 清理日志、socket、数据库等残留"
+echo
+echo "不会主动暴力清空系统全局 iptables / nftables 规则。"
+echo
+
+read -rp "确认继续？输入 yes: " CONFIRM
+if [ "${CONFIRM}" != "yes" ]; then
+yellow "已取消卸载"
+return
+fi
+
+yellow "🧹 正在停止 Fail2Ban..."
+systemctl stop fail2ban >/dev/null 2>&1 || true
+systemctl disable fail2ban >/dev/null 2>&1 || true
+
+yellow "🧹 正在删除配置文件..."
+rm -f /etc/fail2ban/jail.local
+rm -f /etc/logrotate.d/fail2ban
+
+yellow "🧹 正在卸载 fail2ban 软件包..."
+if [ "${OS_FAMILY}" = "debian" ]; then
+apt-get remove -y fail2ban >/dev/null 2>&1 || true
+apt-get purge -y fail2ban >/dev/null 2>&1 || true
+apt-get autoremove -y >/dev/null 2>&1 || true
+else
+yum remove -y fail2ban >/dev/null 2>&1 || true
+fi
+
+yellow "🧹 正在清理残留文件..."
+rm -rf /var/log/fail2ban.log*
+rm -rf /var/lib/fail2ban
+rm -rf /var/run/fail2ban
+rm -rf /run/fail2ban
+
+green "✅ Fail2Ban 已完成卸载"
+echo
+echo "你可以手动确认："
+echo " systemctl status fail2ban"
+echo " which fail2ban-client"
+echo " ls -lah /etc/fail2ban /var/lib/fail2ban /run/fail2ban"
+}
+
+show_menu() {
+clear
+echo "================================================"
+echo " 🛡️ Fail2Ban 一键防护管理脚本"
+echo "================================================"
+echo " 1. 安装 / 重装 Fail2Ban 防护"
+echo " 2. 查看 Fail2Ban 总状态"
+echo " 3. 查看 SSHD Jail 状态"
+echo " 4. 手动解封 IP"
+echo " 5. 卸载当前脚本配置"
+echo " 0. 退出"
+echo "================================================"
+}
+
+main() {
+need_root
+detect_os || true
+
+while true; do
+show_menu
+read -rp "请输入选项 [0-5]: " CHOICE
+case "${CHOICE}" in
+1)
+install_f2b
+read -rp "按回车继续..."
+;;
+2)
+show_status
+read -rp "按回车继续..."
+;;
+3)
+show_sshd_status
+read -rp "按回车继续..."
+;;
+4)
+unban_ip
+read -rp "按回车继续..."
+;;
+5)
+uninstall_f2b
+read -rp "按回车继续..."
+;;
+0)
+green "已退出"
+exit 0
+;;
+*)
+red "无效选项，请重新输入"
+sleep 1
+;;
+esac
+done
 }
 
 main "$@"
