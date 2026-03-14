@@ -194,8 +194,12 @@ systemctl restart fail2ban
 
 verify_fail2ban() {
 log "步骤 7: 验证状态..."
-fail2ban-client ping >/dev/null
 
+local retries=10
+local i=1
+
+while [ $i -le $retries ]; do
+if fail2ban-client ping >/dev/null 2>&1; then
 echo "✅ 部署完成！"
 echo "------------------------------------------------"
 echo "🛡️ 已启用：递增封禁 + 惯犯重罚 + 日志轮转"
@@ -210,7 +214,19 @@ echo " fail2ban-client status"
 echo " fail2ban-client status sshd"
 echo " fail2ban-client set sshd unbanip <IP>"
 echo " tail -f /var/log/fail2ban.log"
+return 0
+fi
+
+sleep 1
+i=$((i+1))
+done
+
+err "Fail2Ban 启动超时，请手动排查："
+echo " systemctl status fail2ban --no-pager -l"
+echo " journalctl -u fail2ban -n 80 --no-pager"
+exit 1
 }
+
 
 main() {
 detect_os
